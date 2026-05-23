@@ -40,8 +40,11 @@ export default function App() {
     setAiError(null);
 
     try {
-      const res = await fetch(`http://localhost:8000/api/analyze/${sku}`, {
-        headers: { 'X-API-Key': 'super_secret_wb_key_123' }
+      const res = await fetch(`${API_BASE_URL}/api/analyze/${sku}`, {
+        headers: { 
+          'X-API-Key': 'super_secret_wb_key_123',
+          'Bypass-Tunnel-Reminder': 'true'
+        }
       });
       const result = await res.json();
       if (!res.ok) {
@@ -60,11 +63,12 @@ export default function App() {
     setAiLoading(true);
     setAiError(null);
     try {
-      const res = await fetch(`http://localhost:8000/api/ai-report`, {
+      const res = await fetch(`${API_BASE_URL}/api/ai-report`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          'X-API-Key': 'super_secret_wb_key_123'
+          'X-API-Key': 'super_secret_wb_key_123',
+          'Bypass-Tunnel-Reminder': 'true'
         },
         body: JSON.stringify(data)
       });
