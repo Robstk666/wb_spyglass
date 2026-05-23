@@ -162,9 +162,9 @@ _settings = get_settings()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_settings.cors_origins,
+    allow_origins=["*"], # Разрешаем все домены (в т.ч. Vercel)
     allow_credentials=True,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
