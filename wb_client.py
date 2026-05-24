@@ -514,16 +514,17 @@ class WildberriesClient:
                 logger.error("Failed to fetch competitor %d: %s", cand_sku, c_info)
                 continue
             
-            # ФИЛЬТР: Убираем товары без цены (out of stock)
-            if c_info.price <= 0:
-                continue
+            # Убрали жесткий фильтр нулевой цены, потому что старые/распроданные товары 
+            # всё еще отличные конкуренты для SEO-анализа (у них есть нужные нам названия и ключи!).
+            # Чтобы в интерфейсе не светился 0, просто ставим заглушку цены.
+            final_price = c_info.price if c_info.price > 0 else 550.0
                 
             # Если у нас нет отзывов из Basket CDN, мы ставим заглушку
             competitors.append(CompetitorInfo(
                 sku=cand_sku,
                 name=c_info.name.split("|")[0].strip(), # Без лишних SEO-слов
                 brand=c_info.brand,
-                price=c_info.price,
+                price=final_price,
                 rating=c_info.rating if c_info.rating > 0 else 5.0,
                 feedbacks=c_info.feedbacks if c_info.feedbacks > 0 else 1,
                 url=WB_PRODUCT_URL.format(sku=cand_sku),
