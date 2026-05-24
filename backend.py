@@ -386,11 +386,15 @@ async def ai_report(
         import asyncio
         asyncio.create_task(send_telegram_alert(err_str))
         
-        return JSONResponse(status_code=200, content={
-            "status": "ai_vacation",
-            "cringe_message": "Наш главный SEO-гуру улетел на Бали и забыл ноутбук 🌴",
-            "tech_message": "Из-за гео-блокировок произошел сбой нейросети. Отправьте отчет администратору."
-        })
+        # Возвращаем статус success, чтобы фронтенд точно отрисовал ошибку в полях!
+        return {
+            "status": "success",
+            "seo_report": {
+                "missing_keywords": [f"Ошибка ИИ: {type(exc).__name__}"],
+                "recommendations": f"Сбой генерации нейросети: {str(exc)}. Пожалуйста, проверьте баланс OpenRouter или правильность API ключа в Railway.",
+                "optimized_title": "ОШИБКА ГЕНЕРАЦИИ",
+            }
+        }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
