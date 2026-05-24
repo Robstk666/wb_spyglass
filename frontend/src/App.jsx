@@ -1,6 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import { Search, Loader2, Sparkles, TrendingUp, Package, AlertTriangle, ToggleLeft, ToggleRight } from 'lucide-react';
 
+const API_BASE_URL = 'https://afraid-adults-yell.loca.lt';
+
 export default function App() {
   const [sku, setSku] = useState('');
   const [loading, setLoading] = useState(false);
