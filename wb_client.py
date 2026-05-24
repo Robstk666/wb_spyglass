@@ -159,7 +159,7 @@ async def _get(session: AsyncSession, url: str, label: str = "") -> dict | None:
     for attempt, delay in enumerate(_RETRY_DELAYS, 1):
         try:
             logger.info("%sGET %s (attempt %d)", tag, url[:120], attempt)
-            resp = await session.get(url, headers=_HEADERS, timeout=15)
+            resp = await session.get(url, headers=_HEADERS, timeout=5)
             if resp.status_code == 200:
                 try:
                     return resp.json()
@@ -177,7 +177,7 @@ async def _get(session: AsyncSession, url: str, label: str = "") -> dict | None:
             return None
     # финальная попытка
     try:
-        resp = await session.get(url, headers=_HEADERS, timeout=20)
+        resp = await session.get(url, headers=_HEADERS, timeout=5)
         if resp.status_code == 200:
             return resp.json()
     except Exception as exc:
@@ -459,24 +459,26 @@ class WildberriesClient:
             logger.warning("No organic competitors found via DDG for query='%s'", search_query)
             return competitors
 
-        # Собираем данные по конкурентам через Basket CDN (уже реализовано в fetch_product)
-        for cand_sku in cand_skus:
-            try:
-                # Получаем данные конкурента поштучно (т.к. v2 закрыт, это пойдет через фолбек price-history на CDN)
-                c_info = await self.fetch_product(cand_sku)
-                # Если у нас нет отзывов из Basket CDN, мы ставим заглушку
-                competitors.append(CompetitorInfo(
-                    sku=cand_sku,
-                    name=c_info.name.split("|")[0].strip(), # Без лишних SEO-слов
-                    brand=c_info.brand,
-                    price=c_info.price,
-                    rating=c_info.rating if c_info.rating > 0 else 4.5, # заглушка для органики, т.к. CDN не отдает рейтинг
-                    feedbacks=c_info.feedbacks if c_info.feedbacks > 0 else 150,
-                    url=WB_PRODUCT_URL.format(sku=cand_sku),
-                    subject_id=c_info.subject_id,
-                ))
-            except Exception as e:
-                logger.error("Failed to fetch competitor %d: %s", cand_sku, e)
+        # Собираем данные по конкурентам параллельно, чтобы не падать по таймауту Vercel (15s)
+        tasks = [self.fetch_product(cand_sku) for cand_sku in cand_skus]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        for cand_sku, c_info in zip(cand_skus, results):
+            if isinstance(c_info, Exception):
+                logger.error("Failed to fetch competitor %d: %s", cand_sku, c_info)
+                continue
+            
+            # Если у нас нет отзывов из Basket CDN, мы ставим заглушку
+            competitors.append(CompetitorInfo(
+                sku=cand_sku,
+                name=c_info.name.split("|")[0].strip(), # Без лишних SEO-слов
+                brand=c_info.brand,
+                price=c_info.price,
+                rating=c_info.rating if c_info.rating > 0 else 4.5, # заглушка для органики, т.к. CDN не отдает рейтинг
+                feedbacks=c_info.feedbacks if c_info.feedbacks > 0 else 150,
+                url=WB_PRODUCT_URL.format(sku=cand_sku),
+                subject_id=c_info.subject_id,
+            ))
 
         logger.info("Found %d competitors for '%s'", len(competitors), search_query)
         return competitors
