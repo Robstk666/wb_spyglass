@@ -195,18 +195,24 @@ export default function App() {
                 <p className="text-sm text-slate-400 italic">Конкуренты не найдены (возможно, товар уникален или нет данных в категории).</p>
               ) : (
                 data.competitors.map((comp, idx) => (
-                  <div key={idx} className="flex items-center justify-between p-3 rounded-xl bg-slate-800/40 border border-slate-700/50 hover:border-slate-600 transition-colors">
+                  <a 
+                    href={comp.url} 
+                    target="_blank" 
+                    rel="noopener noreferrer" 
+                    key={idx} 
+                    className="flex items-center justify-between p-3 rounded-xl bg-slate-800/40 border border-slate-700/50 hover:border-[#48E5C2]/50 hover:bg-slate-800/80 transition-all cursor-pointer group"
+                  >
                     <div className="flex items-center gap-3 overflow-hidden">
-                      <div className="w-6 h-6 rounded-full bg-slate-700 text-slate-300 flex items-center justify-center text-xs font-bold shrink-0">
+                      <div className="w-6 h-6 rounded-full bg-slate-700 group-hover:bg-[#48E5C2]/20 text-slate-300 group-hover:text-[#48E5C2] flex items-center justify-center text-xs font-bold shrink-0 transition-colors">
                         {idx + 1}
                       </div>
                       <div className="truncate">
-                        <div className="text-sm font-medium text-slate-200 truncate">{comp.name}</div>
-                        <div className="text-xs text-slate-500">{comp.brand} · {comp.feedbacks} отз.</div>
+                        <div className="text-sm font-medium text-slate-200 group-hover:text-white truncate transition-colors">{comp.name}</div>
+                        <div className="text-xs text-slate-500 group-hover:text-slate-400 transition-colors">{comp.brand} · {comp.feedbacks} отз.</div>
                       </div>
                     </div>
-                    <div className="text-sm font-bold text-white shrink-0 ml-4">{comp.price} ₽</div>
-                  </div>
+                    <div className="text-sm font-bold text-white shrink-0 ml-4 group-hover:text-[#48E5C2] transition-colors">{comp.price}</div>
+                  </a>
                 ))
               )}
             </div>
