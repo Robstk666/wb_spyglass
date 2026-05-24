@@ -1,61 +1,53 @@
 """
-wb_client.py — Асинхронный клиент Wildberries API с обходом WAF.
+wb_client.py — Асинхронный клиент Wildberries API v2.
 
-Проблема: WB WAF (Firewall) блокирует запросы от стандартных HTTP-библиотек
-(httpx, requests), анализируя TLS-fingerprint (JA3/JA3S).
+Стратегия (по документации WB Enterprise):
 
-Решение: curl_cffi — обёртка над libcurl с поддержкой TLS-impersonation.
-Параметр impersonate="chrome120" заставляет клиент отправлять точный
-TLS ClientHello от Chrome 120, неотличимый от реального браузера.
+  1. Basket CDN (бесплатно, без rate-limit):
+     basket-N.wbbasket.ru/.../card.json
+     → imt_name, subj_name (для поискового запроса), SEO-options
 
-Стратегия получения карточки товара:
-  1. basket-N.wb.ru (CDN, без rate-limit, вычисляется из артикула)
-  2. basket-N.wbbasket.com (резервный CDN домен)
-  3. search.wb.ru ?query={sku} (fallback с retry при 429)
+  2. card.wb.ru/cards/v2/detail (динамические данные):
+     → salePriceU, priceU, rating, feedbacks
+     → поддерживает батчинг (несколько SKU в одном запросе)
 
-Стратегия получения конкурентов:
-  search.wb.ru ?subject={subject_id} с retry при 429.
+  3. search.wb.ru (поиск конкурентов):
+     → query={subj_name} (НЕ subject_id!)
+     → sort=popular, фильтрация рекламы по log.advertId
 """
 
 import asyncio
 import logging
 import random
+import urllib.parse
 from dataclasses import dataclass, field
 
 from curl_cffi.requests import AsyncSession
 
 logger = logging.getLogger(__name__)
 
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Константы
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Браузер для TLS-impersonation (Chrome 120 — актуальный, хорошо проходит WAF)
 _IMPERSONATE = "chrome120"
 
-# URL для поиска конкурентов (search.wb.ru)
+# v2 — актуальная версия, поддерживает батчинг (nm=id1;id2;id3)
+WB_CARD_V2_URL = (
+    "https://card.wb.ru/cards/v2/detail"
+    "?appType=1&curr=rub&dest=-1257786&spp=30&ab_testing=false&nm={nms}"
+)
+
+# Поисковый API — конкуренты по ключевому запросу
 WB_SEARCH_URL = (
     "https://search.wb.ru/exactmatch/ru/common/v7/search"
     "?appType=1&curr=rub&dest=-1257786&page=1&resultset=catalog"
-    "&sort=popular&suppressSpellcheck=false&subject={subject_id}"
+    "&sort=popular&suppressSpellcheck=false&ab_testid=no_reranking&spp=30"
+    "&query={query}"
 )
 
-# URL для получения детальной карточки товара
-WB_DETAIL_URL = "https://card.wb.ru/cards/v1/detail?appType=1&curr=rub&dest=-1257786&spp=30&nm={sku}"
-
-# Поиск одного товара по артикулу (fallback для карточки)
-WB_SEARCH_SINGLE_URL = (
-    "https://search.wb.ru/exactmatch/ru/common/v7/search"
-    "?appType=1&curr=rub&dest=-1257786&page=1&resultset=catalog"
-    "&suppressSpellcheck=false&query={sku}"
-)
-
-# Публичная ссылка на карточку товара
 WB_PRODUCT_URL = "https://www.wildberries.ru/catalog/{sku}/detail.aspx"
 
-# Полный набор "человеческих" заголовков от десктопного Chrome
-# Sec-Fetch-* критически важны — WAF их проверяет
 _HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -74,81 +66,71 @@ _HEADERS = {
     "x-spa-version": "13.3.3",
 }
 
-# Задержки retry при 429 (секунды) + случайный jitter ±1s
-_RETRY_DELAYS = [5, 15, 30]
+_RETRY_DELAYS = [3, 10, 25]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Вычисление basket CDN URL
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _get_basket_card_urls(sku: int) -> list[str]:
+def _basket_urls(sku: int) -> list[str]:
     """
-    Возвращает список CDN URL карточки товара (basket-серверы WB).
-
-    Алгоритм:
-      vol  = sku // 100_000  — определяет номер сервера
-      part = sku // 1_000    — директория
-
-    Возвращает два домена (wb.ru основной, wbbasket.com резервный).
-    Basket CDN отдаёт статичный JSON без rate-limit.
+    Возвращает CDN URLs карточки товара (basket-серверы WB).
+    Возвращает несколько URL с соседними номерами корзин — таблица маппинга
+    WB меняется, поэтому перебираем ±2 соседа для надёжности.
     """
     vol  = sku // 100_000
     part = sku // 1_000
 
-    if   vol <= 143:  b_num = 1
-    elif vol <= 287:  b_num = 2
-    elif vol <= 431:  b_num = 3
-    elif vol <= 719:  b_num = 4
-    elif vol <= 1007: b_num = 5
-    elif vol <= 1061: b_num = 6
-    elif vol <= 1115: b_num = 7
-    elif vol <= 1169: b_num = 8
-    elif vol <= 1313: b_num = 9
-    elif vol <= 1601: b_num = 10
-    elif vol <= 1655: b_num = 11
-    elif vol <= 1919: b_num = 12
-    elif vol <= 2045: b_num = 13
-    elif vol <= 2189: b_num = 14
+    if   vol <= 143:  b = 1
+    elif vol <= 287:  b = 2
+    elif vol <= 431:  b = 3
+    elif vol <= 575:  b = 4
+    elif vol <= 719:  b = 5
+    elif vol <= 863:  b = 6
+    elif vol <= 1007: b = 7
+    elif vol <= 1061: b = 8
+    elif vol <= 1115: b = 9
+    elif vol <= 1169: b = 10
+    elif vol <= 1313: b = 11
+    elif vol <= 1601: b = 12
+    elif vol <= 1655: b = 13
+    elif vol <= 1919: b = 14
+    elif vol <= 2045: b = 15
+    elif vol <= 2189: b = 16
     else:
         import math
-        b_num = 14 + math.ceil((vol - 2189) / 216)
+        b = 16 + math.ceil((vol - 2189) / 216)
 
     path = f"/vol{vol}/part{part}/{sku}/info/ru/card.json"
-    
+
+    # Перебираем b-2 .. b+2 чтобы гарантированно попасть в нужный сервер
     urls = []
-    # Для новых артикулов WB часто смещает корзину на +-1, поэтому перебираем соседей:
-    targets = [b_num] if b_num <= 14 else [b_num, b_num - 1, b_num + 1]
-    
-    for t in targets:
-        s_num = f"{t:02d}"
-        urls.append(f"https://basket-{s_num}.wbbasket.ru{path}")
-        urls.append(f"https://basket-{s_num}.wb.ru{path}")
-        
+    for candidate in range(max(1, b - 2), b + 3):
+        urls.append(f"https://basket-{candidate:02d}.wbbasket.ru{path}")
     return urls
 
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Датаклассы — строгие контракты данных
+# Датаклассы
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class ProductInfo:
-    """Данные целевого товара."""
     sku:          int
     name:         str
     brand:        str
     brand_id:     int
-    price:        float    # в рублях
+    price:        float    # рубли
     rating:       float
     feedbacks:    int
     subject_id:   int
-    subject_name: str
+    subject_name: str      # используется как поисковый запрос для конкурентов
 
 
 @dataclass
 class CompetitorInfo:
-    """Один конкурент из топа категории."""
     sku:       int
     name:      str
     brand:     str
@@ -161,179 +143,96 @@ class CompetitorInfo:
 
 @dataclass
 class WBAnalysisData:
-    """Итоговый результат сбора данных."""
     target:      ProductInfo
     competitors: list[CompetitorInfo] = field(default_factory=list)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Вспомогательные функции
+# HTTP-хелпер
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _safe_price(raw: int | None) -> float:
-    """Конвертирует WB-цену (в копейках × 10) → рубли."""
+async def _get(session: AsyncSession, url: str, label: str = "") -> dict | None:
+    """GET с retry при 429. Возвращает JSON или None."""
+    tag = f"[{label}] " if label else ""
+    for attempt, delay in enumerate(_RETRY_DELAYS, 1):
+        try:
+            logger.info("%sGET %s (attempt %d)", tag, url[:120], attempt)
+            resp = await session.get(url, headers=_HEADERS, timeout=15)
+            if resp.status_code == 200:
+                try:
+                    return resp.json()
+                except Exception:
+                    return None
+            if resp.status_code == 429:
+                wait = delay + random.uniform(0.5, 1.5)
+                logger.warning("%s429 rate-limit → wait %.1fs", tag, wait)
+                await asyncio.sleep(wait)
+                continue
+            logger.warning("%sHTTP %d for %s", tag, resp.status_code, url[:80])
+            return None
+        except Exception as exc:
+            logger.warning("%sRequest error: %s", tag, exc)
+            return None
+    # финальная попытка
+    try:
+        resp = await session.get(url, headers=_HEADERS, timeout=20)
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception as exc:
+        logger.error("%sFinal attempt failed: %s", tag, exc)
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Извлечение данных
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _price_from_v2(product: dict) -> float:
+    """Извлекает цену из ответа card.wb.ru v2 (в копейках → рубли)."""
+    # salePriceU — итоговая цена со всеми скидками
+    raw = (
+        product.get("salePriceU")
+        or product.get("clientPriceU")
+        or product.get("priceU")
+    )
+    if not raw:
+        sizes = product.get("sizes", [])
+        if sizes:
+            p = sizes[0].get("price", {})
+            raw = (
+                p.get("salePriceU")
+                or p.get("clientPriceU")
+                or p.get("priceU")
+                or p.get("product")
+                or p.get("basic")
+            )
     return round(raw / 100, 2) if raw else 0.0
 
 
-def _extract_search_product(data: dict) -> dict:
+def _is_ad(product: dict) -> bool:
     """
-    Извлекает поля из одного объекта в data.products[]
-    (формат search.wb.ru).
+    Правильная проверка рекламы: advertId внутри log, а не просто наличие log.
+    Также проверяем cpmPath и флаги.
     """
-    sizes = data.get("sizes", [])
-    raw_price = 0
-    # Приоритетное безопасное извлечение цены (сначала ищем в корне)
-    raw_price = (
-        data.get("clientPriceU") 
-        or data.get("salePriceU") 
-        or data.get("priceU")
-    )
-    # Если в корне нет, ищем внутри блока sizes[0].price (как часто бывает в новом API)
-    if not raw_price and sizes:
-        price_block = sizes[0].get("price", {})
-        raw_price = (
-            price_block.get("clientPriceU") 
-            or price_block.get("salePriceU") 
-            or price_block.get("priceU")
-            or price_block.get("product") 
-            or price_block.get("basic") 
-            or 0
-        )
-
-    return {
-        "sku":          data.get("id", 0),
-        "name":         data.get("name", "").strip(),
-        "brand":        data.get("brand", "").strip(),
-        "brand_id":     data.get("brandId", 0),
-        "price":        _safe_price(raw_price),
-        "rating":       round(data.get("reviewRating", 0.0), 1),
-        "feedbacks":    data.get("feedbacks", 0),
-        "subject_id":   data.get("subjectId", 0),
-        "subject_name": data.get("subjectName", ""),
-    }
+    log = product.get("log", {})
+    if isinstance(log, dict) and log.get("advertId"):
+        return True
+    flags = product.get("flags", {})
+    if isinstance(flags, dict) and (flags.get("isPromo") or flags.get("isAd")):
+        return True
+    return False
 
 
-def _parse_basket_card(sku: int, card: dict) -> ProductInfo:
-    """
-    Парсит ответ basket CDN (card.json) в ProductInfo.
-
-    Формат basket отличается от search API — плоская структура:
-      imt_name  → название
-      selling.* → цена и бренд
-      review_rating → рейтинг
-    """
-    name     = card.get("imt_name") or card.get("subj_name", "")
-    selling  = card.get("selling", {})
-    brand    = selling.get("brand_name") or card.get("brand", "")
-    brand_id = selling.get("brand_id") or 0
-
-    # В basket CDN формат цены может отличаться, но также применяем безопасное извлечение (client_price, price_sale, price, imt_price)
-    raw_price = (
-        selling.get("client_price")
-        or selling.get("price_sale")
-        or selling.get("price")
-        or card.get("imt_price", 0)
-    )
-    price        = _safe_price(raw_price)
-    rating       = round(card.get("review_rating", 0.0), 1)
-    feedbacks    = card.get("feedbacks", 0)
-    subject_id   = card.get("subj_id", 0) or card.get("subject_id", 0)
-    subject_name = card.get("subj_name", "") or card.get("subject", "")
-
-    # Извлекаем SEO-слова (LSI-ядро) из массива options (характеристики товара)
-    options = card.get("options", [])
-    seo_words = []
+def _extract_seo_keywords(options: list) -> str:
+    """Извлекает SEO-ключи из массива options basket CDN."""
+    words = []
     for opt in options:
         val = opt.get("value", "")
         if isinstance(val, str) and len(val) > 2:
-            seo_words.append(val)
+            words.append(val)
         elif isinstance(val, list):
-            seo_words.extend([str(v) for v in val if len(str(v)) > 2])
-
-    if seo_words:
-        # Добавляем SEO слова в name, чтобы AI Analyzer мог найти их как "упущенные ключи"
-        # Делаем это аккуратно, чтобы не испортить внешний вид (добавляем через разделитель)
-        # Так как фронт и бэк не ждут нового поля, это самый безопасный способ передачи LSI.
-        seo_text = " ".join(seo_words[:5]) # берем топ-5 слов
-        name = f"{name} ({seo_text})"
-
-    logger.info(
-        "Basket CDN parsed: name='%s' brand='%s' price=%.2f subjectId=%s",
-        name, brand, price, subject_id,
-    )
-    return ProductInfo(
-        sku=sku, name=name, brand=brand, brand_id=brand_id,
-        price=price, rating=rating, feedbacks=feedbacks,
-        subject_id=subject_id, subject_name=subject_name,
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Низкоуровневый HTTP-хелпер с retry
-# ─────────────────────────────────────────────────────────────────────────────
-
-async def _get_with_retry(
-    session: AsyncSession,
-    url: str,
-    label: str = "",
-) -> dict | None:
-    """
-    Выполняет GET-запрос через curl_cffi. Если запрос к WB API, он обернут 
-    через AllOrigins прокси.
-
-
-    - При 200 → возвращает распарсенный JSON.
-    - При 429 → retry с задержками 5s / 15s / 30s + jitter.
-    - При 4xx (кроме 429) → возвращает None (не паникуем, пробуем дальше).
-    - При сетевой ошибке → возвращает None.
-
-    Args:
-        session: открытая curl_cffi AsyncSession
-        url:     целевой URL
-        label:   описание для логов
-
-    Returns:
-        dict с JSON-ответом или None при неудаче.
-    """
-    tag = f"[{label}] " if label else ""
-
-    for attempt, delay in enumerate(_RETRY_DELAYS, start=1):
-        try:
-            logger.info("%sGET %s (attempt %d)", tag, url, attempt)
-            resp = await session.get(url, headers=_HEADERS, timeout=15)
-
-            if resp.status_code == 200:
-                return resp.json()
-
-            if resp.status_code == 429:
-                jitter = random.uniform(0.5, 1.5)
-                wait   = delay + jitter
-                logger.warning(
-                    "%s429 rate-limit. Waiting %.1fs before retry %d/%d",
-                    tag, wait, attempt, len(_RETRY_DELAYS),
-                )
-                await asyncio.sleep(wait)
-                continue
-
-            # 404, 403, 5xx — не retry, просто сообщаем
-            logger.warning("%sHTTP %s for %s", tag, resp.status_code, url)
-            return None
-
-        except Exception as exc:
-            logger.warning("%sRequest error: %s — %s", tag, url, exc)
-            return None
-
-    # Финальная попытка после последней задержки
-    try:
-        logger.info("%sFinal attempt: GET %s", tag, url)
-        resp = await session.get(url, headers=_HEADERS, timeout=15)
-        if resp.status_code == 200:
-            return resp.json()
-        logger.error("%sFailed after all retries. Last status: %s", tag, resp.status_code)
-    except Exception as exc:
-        logger.error("%sFinal attempt failed: %s", tag, exc)
-
-    return None
+            words.extend(str(v) for v in val if len(str(v)) > 2)
+    return " ".join(words[:8])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -342,234 +241,224 @@ async def _get_with_retry(
 
 class WildberriesClient:
     """
-    Асинхронный клиент Wildberries с TLS-impersonation (curl_cffi).
+    Асинхронный клиент WB. Использует Chrome 120 TLS fingerprint (curl_cffi).
 
-    Использует Chrome 120 TLS fingerprint для обхода WAF WB.
-    Создаётся через async context manager:
-
-        async with WildberriesClient() as wb:
-            data = await wb.analyze(sku)
+    Стратегия:
+      - Basket CDN — метаданные (имя, категория, SEO)
+      - card.wb.ru v2 — динамика (цена, рейтинг, отзывы)
+      - search.wb.ru — поиск конкурентов по ключевому запросу
     """
 
     async def __aenter__(self) -> "WildberriesClient":
-        # Одна сессия на весь запрос — keep-alive соединения
         self._session = AsyncSession(impersonate=_IMPERSONATE)
         return self
 
     async def __aexit__(self, *_) -> None:
         await self._session.close()
 
-    # ── Получение карточки товара ─────────────────────────────────────────────
+    async def _fetch_basket_meta(self, sku: int) -> dict | None:
+        """Получает статические метаданные из Basket CDN."""
+        for url in _basket_urls(sku):
+            data = await _get(self._session, url, label="basket")
+            if data and (data.get("imt_name") or data.get("subj_name")):
+                return data
+        return None
+
+    async def _fetch_v2_prices(self, skus: list[int]) -> dict[int, dict]:
+        """
+        Батч-запрос к card.wb.ru v2 — получает цены/рейтинги для списка SKU.
+        Возвращает словарь {sku: product_dict}.
+        """
+        nms = ";".join(str(s) for s in skus)
+        url = WB_CARD_V2_URL.format(nms=nms)
+        data = await _get(self._session, url, label="card-v2")
+        result = {}
+        if data:
+            for p in data.get("data", {}).get("products", []):
+                pid = p.get("id")
+                if pid:
+                    result[pid] = p
+        return result
 
     async def fetch_product(self, sku: int) -> ProductInfo:
         """
-        Получает данные карточки товара по SKU.
-
-        Стратегия (без моков — только реальные данные):
-          1. search.wb.ru ?query=  → дает полные данные (цена, рейтинг, subject_id)
-          2. basket-N.wb.ru    → статичный CDN (fallback без цены и subject_id)
-
-        Raises:
-            ValueError: товар не найден ни одним методом.
+        Получает карточку товара:
+          1. Basket CDN → имя, subj_name, subject_id, SEO
+          2. card.wb.ru v2 → цена, рейтинг, feedbacks
+          3. Если v2 недоступен — берём что есть из search.wb.ru
         """
         logger.info("▶ fetch_product SKU=%d", sku)
-        
-        # ── 1: search.wb.ru (Основной API, дает полные данные) ───
-        search_url = WB_SEARCH_SINGLE_URL.format(sku=sku)
-        data = await _get_with_retry(self._session, search_url, label="search-single")
 
-        if data:
-            products = data.get("data", {}).get("products", [])
-            # Ищем точное совпадение по ID, иначе берём первый результат
-            matched = next((p for p in products if p.get("id") == sku), None)
-            if matched is None and products:
-                matched = products[0]
-            if matched is not None:
-                fields = _extract_search_product(matched)
-                return ProductInfo(
-                    sku=fields["sku"],         name=fields["name"],
-                    brand=fields["brand"],     brand_id=fields["brand_id"],
-                    price=fields["price"],     rating=fields["rating"],
-                    feedbacks=fields["feedbacks"],
-                    subject_id=fields["subject_id"],
-                    subject_name=fields["subject_name"],
-                )
+        # ── Шаг 1: Статические метаданные из Basket CDN ──────────────────────
+        basket = await self._fetch_basket_meta(sku)
 
-        logger.info("Search API unavailable/incomplete for SKU=%d, trying Basket CDN", sku)
+        name         = ""
+        brand        = ""
+        brand_id     = 0
+        subject_id   = 0
+        subject_name = ""
+        seo_keywords = ""
 
-        # ── 3: Basket CDN (Absolute Fallback, нет цены и subject_id) ──────────────
-        for basket_url in _get_basket_card_urls(sku):
-            data = await _get_with_retry(self._session, basket_url, label="basket")
-            if data and data.get("imt_name"):
-                logger.info("Product found via Basket CDN: %s", data.get("imt_name"))
-                return _parse_basket_card(sku, data)
+        if basket:
+            name         = basket.get("imt_name") or basket.get("subj_name", "")
+            selling      = basket.get("selling", {})
+            brand        = selling.get("brand_name", "")
+            brand_id     = selling.get("brand_id", 0) or selling.get("supplier_id", 0)
+            # subject_id живёт в data.subject_id (не в корне!)
+            data_block   = basket.get("data", {})
+            subject_id   = data_block.get("subject_id", 0) or basket.get("subj_id", 0)
+            subject_name = basket.get("subj_name", "") or basket.get("subject", "")
+            seo_keywords = _extract_seo_keywords(basket.get("options", []))
+            logger.info("Basket CDN OK: name='%s' subj='%s' subj_id=%s", name, subject_name, subject_id)
 
-        raise ValueError(
-            f"Товар с артикулом {sku} недоступен: "
-            f"все методы (detail, search, basket CDN) завершились неудачей."
+        # ── Шаг 2: Динамические данные (цена, рейтинг) из card.wb.ru v2 ──────
+        price    = 0.0
+        rating   = 0.0
+        feedbacks = 0
+
+        v2_data = await self._fetch_v2_prices([sku])
+        if sku in v2_data:
+            p = v2_data[sku]
+            price     = _price_from_v2(p)
+            rating    = round(p.get("reviewRating", 0.0), 1)
+            feedbacks = p.get("feedbacks", 0)
+            # Если basket не дал имя — берём из v2
+            if not name:
+                name = p.get("name", "")
+            if not brand:
+                brand = p.get("brand", "")
+            if not subject_id:
+                subject_id = p.get("subjectId", 0)
+            if not subject_name:
+                subject_name = p.get("subjectName", "")
+            logger.info("card.wb.ru v2 OK: price=%.2f rating=%.1f feedbacks=%d", price, rating, feedbacks)
+        else:
+            logger.warning("card.wb.ru v2 unavailable for SKU=%d, falling back to search", sku)
+            # Фолбек: search.wb.ru?query=SKU
+            search_url = (
+                "https://search.wb.ru/exactmatch/ru/common/v7/search"
+                f"?appType=1&curr=rub&dest=-1257786&page=1&resultset=catalog"
+                f"&suppressSpellcheck=false&query={sku}"
+            )
+            sdata = await _get(self._session, search_url, label="search-sku")
+            if sdata:
+                products = sdata.get("data", {}).get("products", [])
+                matched = next((p for p in products if p.get("id") == sku), None)
+                if matched is None and products:
+                    matched = products[0]
+                if matched:
+                    price     = _price_from_v2(matched)
+                    rating    = round(matched.get("reviewRating", 0.0), 1)
+                    feedbacks = matched.get("feedbacks", 0)
+                    if not name:
+                        name = matched.get("name", "")
+                    if not brand:
+                        brand = matched.get("brand", "")
+                    if not subject_id:
+                        subject_id = matched.get("subjectId", 0)
+                    if not subject_name:
+                        subject_name = matched.get("subjectName", "")
+
+        if not name:
+            raise ValueError(f"Товар {sku}: не удалось получить данные ни одним методом.")
+
+        # Обогащаем имя SEO-ключами для AI-анализа
+        display_name = name
+        if seo_keywords:
+            display_name = f"{name} | {seo_keywords}"
+
+        return ProductInfo(
+            sku=sku, name=display_name, brand=brand, brand_id=brand_id,
+            price=price, rating=rating, feedbacks=feedbacks,
+            subject_id=subject_id, subject_name=subject_name,
         )
-
-    # ── Поиск конкурентов ─────────────────────────────────────────────────────
 
     async def fetch_competitors(
         self,
-        subject_id:  int,
-        target_sku:  int,
-        target_name: str,
-        top_n:       int   = 5,
-        min_rating:  float = 4.5,
+        subject_id:   int,
+        target_sku:   int,
+        target_name:  str,
+        subject_name: str = "",
+        top_n:        int = 5,
+        min_rating:   float = 4.0,
     ) -> list[CompetitorInfo]:
         """
-        Ищет топ-N конкурентов в категории subject_id.
+        Ищет топ-N органических конкурентов по ключевому поисковому запросу.
 
-        Фильтры:
-          - Исключает target_sku.
-          - Рейтинг >= min_rating.
-          - Сортировка: max feedbacks (DESC).
+        Стратегия (по документу):
+          1. Строим запрос из subject_name (название предмета)
+          2. search.wb.ru?query={query}&sort=popular
+          3. Фильтруем рекламу по log.advertId (правильный способ)
+          4. Батч-обогащаем цены через card.wb.ru v2
         """
-        url = WB_SEARCH_URL.format(subject_id=subject_id)
-        
-        logger.info(
-            "▶ fetch_competitors subjectId=%d top=%d minRating=%.1f",
-            subject_id, top_n, min_rating,
-        )
+        # Строим поисковый запрос из названия предмета
+        search_query = subject_name.strip() if subject_name.strip() else target_name.split("|")[0].strip()
+
+        logger.info("▶ fetch_competitors query='%s' top=%d", search_query, top_n)
+
+        encoded_query = urllib.parse.quote(search_query)
+        url = WB_SEARCH_URL.format(query=encoded_query)
+
+        data = await _get(self._session, url, label="search-competitors")
+
+        raw_products = []
+        if data:
+            raw_products = data.get("data", {}).get("products", [])
+
+        # Фильтрация: исключаем рекламу и наш товар
+        organic = []
+        for p in raw_products:
+            if _is_ad(p):
+                continue
+            pid = p.get("id", 0)
+            if pid == target_sku:
+                continue
+            r = round(p.get("reviewRating", 0.0), 1)
+            if r < min_rating and p.get("feedbacks", 0) > 0:
+                continue
+            organic.append(p)
+
+        # Сортируем по feedbacks (популярность)
+        organic.sort(key=lambda x: x.get("feedbacks", 0), reverse=True)
+        top_candidates = organic[:top_n]
+
+        if not top_candidates:
+            logger.warning("No organic competitors found for query='%s'", search_query)
+            return []
+
+        # Батч-обогащение ценами из card.wb.ru v2
+        cand_skus = [p.get("id") for p in top_candidates if p.get("id")]
+        prices_map = await self._fetch_v2_prices(cand_skus)
 
         competitors = []
+        for p in top_candidates:
+            pid = p.get("id", 0)
+            price_data = prices_map.get(pid, {})
+            price     = _price_from_v2(price_data) if price_data else _price_from_v2(p)
+            rating    = round(p.get("reviewRating", 0.0), 1)
+            feedbacks = p.get("feedbacks", 0)
 
-        if subject_id > 0:
-            data = await _get_with_retry(self._session, url, label="search-category")
-            if data:
-                raw_products = data.get("data", {}).get("products", [])
-                candidates = []
-                for p in raw_products:
-                    # Фильтрация рекламы (log объект или рекламные флаги)
-                    if "log" in p:
-                        continue
-                    flags = p.get("flags", {})
-                    if flags.get("isPromo") or flags.get("isAd"):
-                        continue
+            competitors.append(CompetitorInfo(
+                sku=pid,
+                name=p.get("name", "").strip(),
+                brand=p.get("brand", "").strip(),
+                price=price,
+                rating=rating,
+                feedbacks=feedbacks,
+                url=WB_PRODUCT_URL.format(sku=pid),
+                subject_id=p.get("subjectId", subject_id),
+            ))
 
-                    f = _extract_search_product(p)
-                    if f["sku"] == target_sku:
-                        continue
-                    if f["rating"] < min_rating:
-                        continue
-                    candidates.append(f)
-
-                candidates.sort(key=lambda x: x["feedbacks"], reverse=True)
-
-                import string
-                # Извлекаем первое существительное (упрощенно - первое слово)
-                first_word = ""
-                words = target_name.split()
-                if words:
-                    first_word = words[0].strip(string.punctuation).lower()
-
-                semantic_matches = []
-                other_matches = []
-
-                for c in candidates:
-                    if first_word and first_word in c["name"].lower():
-                        semantic_matches.append(c)
-                    else:
-                        other_matches.append(c)
-
-                # Добиваем семантические совпадения остальными популярными товарами категории
-                final_candidates = (semantic_matches + other_matches)[:top_n]
-
-                for c in final_candidates:
-                    competitors.append(
-                        CompetitorInfo(
-                            sku=c["sku"],         name=c["name"],
-                            brand=c["brand"],     price=c["price"],
-                            rating=c["rating"],   feedbacks=c["feedbacks"],
-                            url=WB_PRODUCT_URL.format(sku=c["sku"]),
-                            subject_id=c["subject_id"],
-                        )
-                    )
-
-        if not competitors:
-            logger.warning(
-                "Could not fetch competitors via Search API (probably 429 block). "
-                "Falling back to DuckDuckGo search scraping."
-            )
-            # Фолбек через DuckDuckGo для обхода WAF и получения РЕАЛЬНЫХ конкурентов
-            import urllib.parse
-            import re
-            
-            first_word = ""
-            words = target_name.split()
-            import string
-            if words:
-                first_word = words[0].strip(string.punctuation).lower()
-                
-            ddg_query = f"site:wildberries.ru/catalog/ {first_word}"
-            ddg_url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(ddg_query)
-            
-            ddg_data = await _get_with_retry(self._session, ddg_url, label="ddg-search")
-            if ddg_data is None:
-                # Если html.duckduckgo.com вернул текст (а _get_with_retry пытается парсить JSON и возвращает None),
-                # нам нужно сделать отдельный сырой запрос:
-                pass
-
-            # Делаем сырой запрос, так как DDG отдает HTML, а _get_with_retry ждет JSON
-            try:
-                resp = await self._session.get(ddg_url, headers=_HEADERS, impersonate=_IMPERSONATE)
-                if resp.status_code == 200:
-                    html = resp.text
-                    skus = list(set(re.findall(r"wildberries\.ru/catalog/(\d+)/detail", html)))
-                    logger.info("DDG found SKUs: %s", skus)
-                    
-                    for c_sku_str in skus:
-                        if len(competitors) >= top_n:
-                            break
-                        c_sku = int(c_sku_str)
-                        if c_sku == target_sku:
-                            continue
-                            
-                        # Получаем данные конкурента из Basket CDN
-                        for basket_url in _get_basket_card_urls(c_sku):
-                            c_data = await _get_with_retry(self._session, basket_url, label="basket-comp")
-                            if c_data and c_data.get("imt_name"):
-                                parsed = _parse_basket_card(c_sku, c_data)
-                                
-                                # Дополнительная проверка на совпадение слова, чтобы исключить мусор
-                                if first_word and first_word not in parsed.name.lower():
-                                    continue
-                                
-                                competitors.append(
-                                    CompetitorInfo(
-                                        sku=parsed.sku,
-                                        name=parsed.name,
-                                        brand=parsed.brand,
-                                        price=parsed.price,
-                                        rating=parsed.rating,
-                                        feedbacks=parsed.feedbacks,
-                                        url=WB_PRODUCT_URL.format(sku=parsed.sku),
-                                        subject_id=parsed.subject_id,
-                                    )
-                                )
-                                break
-            except Exception as e:
-                logger.error("DDG fallback failed: %s", e)
-
-        logger.info(
-            "Found %d competitors for target %d", len(competitors), target_sku
-        )
+        logger.info("Found %d competitors for '%s'", len(competitors), search_query)
         return competitors
 
-    # ── Полный анализ ─────────────────────────────────────────────────────────
-
     async def analyze(self, sku: int) -> WBAnalysisData:
-        """
-        Полный сбор данных: карточка товара + топ конкурентов.
-
-        Запросы последовательны (нужны данные первого для второго).
-        """
-        target      = await self.fetch_product(sku)
+        """Полный анализ: карточка + конкуренты."""
+        target = await self.fetch_product(sku)
         competitors = await self.fetch_competitors(
             subject_id=target.subject_id,
             target_sku=target.sku,
             target_name=target.name,
+            subject_name=target.subject_name,
         )
         return WBAnalysisData(target=target, competitors=competitors)

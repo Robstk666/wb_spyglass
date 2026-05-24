@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Search, Loader2, Sparkles, TrendingUp, Package, AlertTriangle, ToggleLeft, ToggleRight } from 'lucide-react';
 
-const API_BASE_URL = 'https://wet-hairs-push.loca.lt';
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
 export default function App() {
   const [sku, setSku] = useState('');
