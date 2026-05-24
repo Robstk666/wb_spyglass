@@ -393,6 +393,21 @@ class WildberriesClient:
             # пробуем достать из price-history.json на Basket CDN (никогда не банят)
             if price == 0.0:
                 price = await self._fetch_price_history(sku)
+                
+        # Фолбек 3: Достаем реальные отзывы и рейтинг через открытое API отзывов
+        if feedbacks == 0:
+            for root in [1, 2]:
+                fb_url = f"https://feedbacks{root}.wb.ru/feedbacks/v1/{sku}"
+                fb_data = await _get(self._session, fb_url, label="feedbacks")
+                if fb_data:
+                    feedbacks = fb_data.get("feedbackCountWithText", 0) or len(fb_data.get("feedbacks", []) or [])
+                    val = fb_data.get("valuation", "")
+                    if val:
+                        try:
+                            rating = float(val)
+                        except:
+                            pass
+                    break
 
         if not name:
             raise ValueError(f"Товар {sku}: не удалось получить данные ни одним методом.")
@@ -427,18 +442,23 @@ class WildberriesClient:
 
         # Фолбек: ищем конкурентов через DuckDuckGo Lite (работает без JS и обходит WAF WB)
         import re
+        import os
         import urllib.parse
         ddg_url = "https://lite.duckduckgo.com/lite/"
         # Специальный запрос в поисковик, чтобы найти товары конкретно на WB
         data = {"q": f"site:wildberries.ru/catalog {search_query}"}
-
         
         cand_skus = []
         try:
+            # Используем резидентские прокси для DDG, чтобы не получить блок датацентра
+            proxy = os.getenv("PROXY_URL")
+            proxies = {"http": proxy, "https": proxy} if proxy else None
+            
             resp = await self._session.post(
                 ddg_url, 
                 data=data, 
                 headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+                proxies=proxies,
                 timeout=15
             )
             if resp.status_code == 200:
@@ -449,7 +469,7 @@ class WildberriesClient:
                     if sku_str not in seen and int(sku_str) != target_sku:
                         seen.add(sku_str)
                         cand_skus.append(int(sku_str))
-                        if len(cand_skus) >= top_n:
+                        if len(cand_skus) >= 15: # берем с запасом на случай если нет в наличии
                             break
         except Exception as e:
             logger.error("DuckDuckGo search failed: %s", e)
@@ -468,17 +488,24 @@ class WildberriesClient:
                 logger.error("Failed to fetch competitor %d: %s", cand_sku, c_info)
                 continue
             
+            # ФИЛЬТР: Убираем товары без цены (out of stock)
+            if c_info.price <= 0:
+                continue
+                
             # Если у нас нет отзывов из Basket CDN, мы ставим заглушку
             competitors.append(CompetitorInfo(
                 sku=cand_sku,
                 name=c_info.name.split("|")[0].strip(), # Без лишних SEO-слов
                 brand=c_info.brand,
                 price=c_info.price,
-                rating=c_info.rating if c_info.rating > 0 else 4.5, # заглушка для органики, т.к. CDN не отдает рейтинг
-                feedbacks=c_info.feedbacks if c_info.feedbacks > 0 else 150,
+                rating=c_info.rating if c_info.rating > 0 else 5.0,
+                feedbacks=c_info.feedbacks if c_info.feedbacks > 0 else 1,
                 url=WB_PRODUCT_URL.format(sku=cand_sku),
                 subject_id=c_info.subject_id,
             ))
+            
+            if len(competitors) >= top_n:
+                break
 
         logger.info("Found %d competitors for '%s'", len(competitors), search_query)
         return competitors
