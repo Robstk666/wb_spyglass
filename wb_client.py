@@ -430,7 +430,8 @@ class WildberriesClient:
         import urllib.parse
         ddg_url = "https://lite.duckduckgo.com/lite/"
         # Специальный запрос в поисковик, чтобы найти товары конкретно на WB
-        data = {"q": f'site:wildberries.ru/catalog "{search_query}" "отзывов"'}
+        data = {"q": f"site:wildberries.ru/catalog {search_query}"}
+
         
         cand_skus = []
         try:
