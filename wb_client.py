@@ -300,7 +300,7 @@ class WildberriesClient:
         Basket CDN отдаёт открытую JSON-историю, цена там в копейках.
         """
         for url in _basket_urls(sku):
-            hist_url = url.replace("card.json", "price-history.json")
+            hist_url = url.replace("ru/card.json", "price-history.json")
             data = await _get(self._session, hist_url, label="price-history")
             if data and isinstance(data, list) and len(data) > 0:
                 latest = data[-1]
