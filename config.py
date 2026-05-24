@@ -42,6 +42,9 @@ class Settings(BaseSettings):
     telegram_bot_token: str = ""
     admin_chat_id: str = ""
 
+    # Proxy для WB API (опционально)
+    proxy_url: str = ""
+
     # ── Вспомогательные свойства ──────────────────────────────────────────
     @property
     def cors_origins(self) -> list[str]:

@@ -24,6 +24,8 @@ from dataclasses import dataclass, field
 
 from curl_cffi.requests import AsyncSession
 
+from config import get_settings
+
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -244,13 +246,25 @@ class WildberriesClient:
     Асинхронный клиент WB. Использует Chrome 120 TLS fingerprint (curl_cffi).
 
     Стратегия:
-      - Basket CDN — метаданные (имя, категория, SEO)
+      - Basket CDN — метаданные (имя, категория, SEO) + price-history (фолбек цены)
       - card.wb.ru v2 — динамика (цена, рейтинг, отзывы)
       - search.wb.ru — поиск конкурентов по ключевому запросу
     """
 
     async def __aenter__(self) -> "WildberriesClient":
-        self._session = AsyncSession(impersonate=_IMPERSONATE)
+        settings = get_settings()
+        proxy = settings.proxy_url if settings.proxy_url else None
+        
+        # Если задан прокси, передаём его curl_cffi
+        if proxy:
+            logger.info("Using proxy for WB API: %s", proxy[:20] + "...")
+            self._session = AsyncSession(
+                impersonate=_IMPERSONATE, 
+                proxy=proxy
+            )
+        else:
+            self._session = AsyncSession(impersonate=_IMPERSONATE)
+            
         return self
 
     async def __aexit__(self, *_) -> None:
@@ -279,6 +293,22 @@ class WildberriesClient:
                 if pid:
                     result[pid] = p
         return result
+
+    async def _fetch_price_history(self, sku: int) -> float:
+        """
+        Фолбек: вытягивает цену из истории цен Basket CDN, если v2 заблокирован WAF.
+        Basket CDN отдаёт открытую JSON-историю, цена там в копейках.
+        """
+        for url in _basket_urls(sku):
+            hist_url = url.replace("card.json", "price-history.json")
+            data = await _get(self._session, hist_url, label="price-history")
+            if data and isinstance(data, list) and len(data) > 0:
+                latest = data[-1]
+                rub_price = latest.get("price", {}).get("RUB", 0)
+                if rub_price > 0:
+                    logger.info("Found fallback price in history: %s RUB", rub_price / 100)
+                    return round(rub_price / 100, 2)
+        return 0.0
 
     async def fetch_product(self, sku: int) -> ProductInfo:
         """
@@ -334,7 +364,7 @@ class WildberriesClient:
             logger.info("card.wb.ru v2 OK: price=%.2f rating=%.1f feedbacks=%d", price, rating, feedbacks)
         else:
             logger.warning("card.wb.ru v2 unavailable for SKU=%d, falling back to search", sku)
-            # Фолбек: search.wb.ru?query=SKU
+            # Фолбек 1: search.wb.ru?query=SKU
             search_url = (
                 "https://search.wb.ru/exactmatch/ru/common/v7/search"
                 f"?appType=1&curr=rub&dest=-1257786&page=1&resultset=catalog"
@@ -358,6 +388,11 @@ class WildberriesClient:
                         subject_id = matched.get("subjectId", 0)
                     if not subject_name:
                         subject_name = matched.get("subjectName", "")
+            
+            # Фолбек 2: Если цена всё ещё 0 (WAF заблокировал search.wb.ru тоже),
+            # пробуем достать из price-history.json на Basket CDN (никогда не банят)
+            if price == 0.0:
+                price = await self._fetch_price_history(sku)
 
         if not name:
             raise ValueError(f"Товар {sku}: не удалось получить данные ни одним методом.")
