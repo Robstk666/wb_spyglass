@@ -445,34 +445,60 @@ class WildberriesClient:
         import os
         import urllib.parse
         ddg_url = "https://lite.duckduckgo.com/lite/"
-        # Специальный запрос в поисковик, чтобы найти товары конкретно на WB
-        data = {"q": f"site:wildberries.ru/catalog {search_query}"}
         
+        # Расширяем поиск, чтобы гарантированно собрать 5 конкурентов даже с учетом фильтра 0 цены
+        queries = [
+            f"site:wildberries.ru/catalog {search_query}",
+            f"{search_query} site:wildberries.ru",
+            f"site:wildberries.ru/catalog {search_query} купить",
+        ]
+
         cand_skus = []
-        try:
-            # Используем резидентские прокси для DDG, чтобы не получить блок датацентра
-            proxy = os.getenv("PROXY_URL")
-            proxies = {"http": proxy, "https": proxy} if proxy else None
+        seen = set()
+        
+        proxy = os.getenv("PROXY_URL")
+        proxies = {"http": proxy, "https": proxy} if proxy else None
+        
+        for q in queries:
+            if len(cand_skus) >= 15:
+                break
+                
+            data = {"q": q}
+            resp = None
             
-            resp = await self._session.post(
-                ddg_url, 
-                data=data, 
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
-                proxies=proxies,
-                timeout=15
-            )
-            if resp.status_code == 200:
-                # Извлекаем все SKU из ссылок wildberries.ru/catalog/SKU/detail
+            # Попытка 1: через прокси
+            if proxies:
+                try:
+                    resp = await self._session.post(
+                        ddg_url, 
+                        data=data, 
+                        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+                        proxies=proxies,
+                        timeout=5
+                    )
+                except Exception as e:
+                    logger.warning(f"DDG Proxy failed for '{q}': {e}")
+                    resp = None
+            
+            # Попытка 2: без прокси (напрямую с Vercel/Railway)
+            if resp is None:
+                try:
+                    resp = await self._session.post(
+                        ddg_url, 
+                        data=data, 
+                        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+                        timeout=5
+                    )
+                except Exception as e:
+                    logger.error(f"DDG direct failed for '{q}': {e}")
+                    continue
+
+            if resp and resp.status_code == 200:
                 found = re.findall(r'wildberries\.ru/catalog/(\d+)/detail', resp.text)
-                seen = set()
                 for sku_str in found:
                     if sku_str not in seen and int(sku_str) != target_sku:
                         seen.add(sku_str)
                         cand_skus.append(int(sku_str))
-                        if len(cand_skus) >= 15: # берем с запасом на случай если нет в наличии
-                            break
-        except Exception as e:
-            logger.error("DuckDuckGo search failed: %s", e)
 
         competitors = []
         if not cand_skus:
