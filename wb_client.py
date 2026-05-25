@@ -456,57 +456,89 @@ class WildberriesClient:
         cand_skus = []
         seen = set()
         
-        proxy = os.getenv("PROXY_URL")
-        proxies = {"http": proxy, "https": proxy} if proxy else None
-        
-        for q in queries:
-            if len(cand_skus) >= 15:
-                break
-                
-            data = {"q": q}
-            resp = None
-            
-            # Попытка 1: через прокси
-            if proxies:
-                try:
-                    resp = await self._session.post(
-                        ddg_url, 
-                        data=data, 
-                        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
-                        proxies=proxies,
-                        timeout=5
+        # Попытка 0: Ищем через Serper.dev API (стабильный Google Search)
+        import os
+        serper_key = os.getenv("SERPER_API_KEY", "a868a0c0787a2fbc654c311f90455967efa81745")
+        if serper_key:
+            logger.info("Trying Serper.dev for query='%s'", search_query)
+            try:
+                # Обходим ограничение site: для бесплатных аккаунтов, используя хитрый запрос
+                s_queries = [
+                    f"wildberries.ru/catalog/ detail {search_query}",
+                    f"wildberries {search_query} отзывы",
+                ]
+                for sq in s_queries:
+                    if len(cand_skus) >= 5: break
+                    payload = {"q": sq, "gl": "ru", "hl": "ru", "num": 20}
+                    s_resp = await self._session.post(
+                        "https://google.serper.dev/search", 
+                        json=payload, 
+                        headers={"X-API-KEY": serper_key, "Content-Type": "application/json"},
+                        timeout=8
                     )
-                except Exception as e:
-                    logger.warning(f"DDG Proxy failed for '{q}': {e}")
-                    resp = None
-            
-            # Попытка 2: без прокси (напрямую с Vercel/Railway)
-            if resp is None:
-                try:
-                    resp = await self._session.post(
-                        ddg_url, 
-                        data=data, 
-                        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
-                        timeout=5
-                    )
-                except Exception as e:
-                    logger.error(f"DDG direct failed for '{q}': {e}")
-                    continue
+                    if s_resp and s_resp.status_code == 200:
+                        data = s_resp.json()
+                        for item in data.get("organic", []):
+                            link = item.get("link", "")
+                            match = re.search(r'wildberries\.ru/catalog/(\d+)/detail', link)
+                            if match:
+                                sku_str = match.group(1)
+                                if sku_str not in seen and int(sku_str) != target_sku:
+                                    seen.add(sku_str)
+                                    cand_skus.append(int(sku_str))
+            except Exception as e:
+                logger.error("Serper API failed: %s", e)
 
-            if resp and resp.status_code == 200:
-                found = re.findall(r'wildberries\.ru/catalog/(\d+)/detail', resp.text)
-                for sku_str in found:
-                    if sku_str not in seen and int(sku_str) != target_sku:
-                        seen.add(sku_str)
-                        cand_skus.append(int(sku_str))
-                        
-        # Абсолютный фолбек для MVP: если прокси мертв (баланс 0) и DDG заблокировал сервер,
-        # отдаем 5 заранее собранных топовых артикулов, чтобы фронтенд и ИИ не падали.
+        # Если Serper не нашел, используем DuckDuckGo
         if not cand_skus:
-            logger.warning("All DDG searches failed. Using hardcoded MVP fallback SKUs.")
-            cand_skus = [346611085, 287152159, 164710883, 281717657, 239729478]
+            proxy = os.getenv("PROXY_URL")
+            proxies = {"http": proxy, "https": proxy} if proxy else None
+            
+            for q in queries:
+                if len(cand_skus) >= 15:
+                    break
+                    
+                data = {"q": q}
+                resp = None
+                
+                # Попытка 1: через прокси
+                if proxies:
+                    try:
+                        resp = await self._session.post(
+                            ddg_url, 
+                            data=data, 
+                            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+                            proxies=proxies,
+                            timeout=5
+                        )
+                    except Exception as e:
+                        logger.warning(f"DDG Proxy failed for '{q}': {e}")
+                        resp = None
+                
+                # Попытка 2: без прокси (напрямую с Vercel/Railway)
+                if resp is None:
+                    try:
+                        resp = await self._session.post(
+                            ddg_url, 
+                            data=data, 
+                            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+                            timeout=5
+                        )
+                    except Exception as e:
+                        logger.error(f"DDG direct failed for '{q}': {e}")
+                        continue
+    
+                if resp and resp.status_code == 200:
+                    found = re.findall(r'wildberries\.ru/catalog/(\d+)/detail', resp.text)
+                    for sku_str in found:
+                        if sku_str not in seen and int(sku_str) != target_sku:
+                            seen.add(sku_str)
+                            cand_skus.append(int(sku_str))
 
         competitors = []
+        if not cand_skus:
+            logger.warning("No organic competitors found via DDG for query='%s'", search_query)
+            return competitors
 
         # Собираем данные по конкурентам параллельно, чтобы не падать по таймауту Vercel (15s)
         tasks = [self.fetch_product(cand_sku) for cand_sku in cand_skus]
