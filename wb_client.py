@@ -447,114 +447,40 @@ class WildberriesClient:
         min_rating:   float = 4.0,
     ) -> list[CompetitorInfo]:
         """
-        Ищет топ-N органических конкурентов.
-        Т.к. динамический поиск WB сильно защищен (x-pow, Qrator), 
-        для MVP используем железобетонный фолбек: поиск SKU через DuckDuckGo + сбор карточек из CDN.
+        Ищет топ-N органических конкурентов через нативный поиск WB.
         """
-        search_query = subject_name.strip() if subject_name.strip() else target_name.split("|")[0].strip()
-        logger.info("▶ fetch_competitors fallback via DuckDuckGo query='%s' top=%d", search_query, top_n)
-
-        # Фолбек: ищем конкурентов через DuckDuckGo Lite (работает без JS и обходит WAF WB)
-        import re
-        import os
         import urllib.parse
-        ddg_url = "https://lite.duckduckgo.com/lite/"
-        
-        # Расширяем поиск, чтобы гарантированно собрать 5 конкурентов даже с учетом фильтра 0 цены
-        queries = [
-            f"site:wildberries.ru/catalog {search_query}",
-            f"{search_query} site:wildberries.ru",
-            f"site:wildberries.ru/catalog {search_query} купить",
-        ]
+        search_query = subject_name.strip() if subject_name.strip() else target_name.split("|")[0].strip()
+        logger.info("▶ fetch_competitors natively via search.wb.ru query='%s' top=%d", search_query, top_n)
 
+        search_url = (
+            "https://search.wb.ru/exactmatch/ru/common/v7/search"
+            f"?appType=1&curr=rub&dest=-1257786&page=1&resultset=catalog"
+            f"&sort=popular&suppressSpellcheck=false&query={urllib.parse.quote(search_query)}"
+        )
+        
         cand_skus = []
-        seen = set()
+        data = await _get(self._session, search_url, label="search-competitors")
         
-        # Попытка 0: Ищем через Serper.dev API (стабильный Google Search)
-        import os
-        serper_key = os.getenv("SERPER_API_KEY", "a868a0c0787a2fbc654c311f90455967efa81745")
-        if serper_key:
-            logger.info("Trying Serper.dev for query='%s'", search_query)
-            try:
-                # Обходим ограничение site: для бесплатных аккаунтов, используя хитрый запрос
-                s_queries = [
-                    f"wildberries.ru/catalog/ detail {search_query}",
-                    f"wildberries {search_query} отзывы",
-                ]
-                for sq in s_queries:
-                    if len(cand_skus) >= 5: break
-                    payload = {"q": sq, "gl": "ru", "hl": "ru", "num": 20}
-                    s_resp = await self._session.post(
-                        "https://google.serper.dev/search", 
-                        json=payload, 
-                        headers={"X-API-KEY": serper_key, "Content-Type": "application/json"},
-                        timeout=8
-                    )
-                    if s_resp and s_resp.status_code == 200:
-                        data = s_resp.json()
-                        for item in data.get("organic", []):
-                            link = item.get("link", "")
-                            match = re.search(r'wildberries\.ru/catalog/(\d+)/detail', link)
-                            if match:
-                                sku_str = match.group(1)
-                                if sku_str not in seen and int(sku_str) != target_sku:
-                                    seen.add(sku_str)
-                                    cand_skus.append(int(sku_str))
-            except Exception as e:
-                logger.error("Serper API failed: %s", e)
-
-        # Если Serper не нашел, используем DuckDuckGo
-        if not cand_skus:
-            proxy = os.getenv("PROXY_URL")
-            proxies = {"http": proxy, "https": proxy} if proxy else None
-            
-            for q in queries:
+        if data and "data" in data and "products" in data["data"]:
+            products = data["data"]["products"]
+            for p in products:
+                cand_sku = p.get("id")
+                if not cand_sku or cand_sku == target_sku:
+                    continue
+                # Считаем конкурентами только товары с рейтингом >= min_rating
+                r = p.get("reviewRating", 0.0)
+                if r >= min_rating or r == 0:  # 0 означает нет отзывов (новинка), берём
+                    cand_skus.append(cand_sku)
                 if len(cand_skus) >= 15:
                     break
-                    
-                data = {"q": q}
-                resp = None
-                
-                # Попытка 1: через прокси
-                if proxies:
-                    try:
-                        resp = await self._session.post(
-                            ddg_url, 
-                            data=data, 
-                            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
-                            proxies=proxies,
-                            timeout=5
-                        )
-                    except Exception as e:
-                        logger.warning(f"DDG Proxy failed for '{q}': {e}")
-                        resp = None
-                
-                # Попытка 2: без прокси (напрямую с Vercel/Railway)
-                if resp is None:
-                    try:
-                        resp = await self._session.post(
-                            ddg_url, 
-                            data=data, 
-                            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
-                            timeout=5
-                        )
-                    except Exception as e:
-                        logger.error(f"DDG direct failed for '{q}': {e}")
-                        continue
-    
-                if resp and resp.status_code == 200:
-                    found = re.findall(r'wildberries\.ru/catalog/(\d+)/detail', resp.text)
-                    for sku_str in found:
-                        if sku_str not in seen and int(sku_str) != target_sku:
-                            seen.add(sku_str)
-                            cand_skus.append(int(sku_str))
 
         competitors = []
         if not cand_skus:
-            logger.warning("No organic competitors found via DDG for query='%s'", search_query)
+            logger.warning("No organic competitors found for query='%s'", search_query)
             return competitors
 
-        # Собираем данные по конкурентам параллельно, чтобы не падать по таймауту Vercel (15s)
+        # Собираем подробные данные по конкурентам
         tasks = [self.fetch_product(cand_sku) for cand_sku in cand_skus]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
@@ -562,20 +488,14 @@ class WildberriesClient:
             if isinstance(c_info, Exception):
                 logger.error("Failed to fetch competitor %d: %s", cand_sku, c_info)
                 continue
-            
-            # Убрали жесткий фильтр нулевой цены, потому что старые/распроданные товары 
-            # всё еще отличные конкуренты для SEO-анализа (у них есть нужные нам названия и ключи!).
-            # Чтобы в интерфейсе не светился 0, просто ставим заглушку цены.
-            final_price = c_info.price if c_info.price > 0 else 550.0
                 
-            # Если у нас нет отзывов из Basket CDN, мы ставим заглушку
             competitors.append(CompetitorInfo(
                 sku=cand_sku,
                 name=c_info.name.split("|")[0].strip(), # Без лишних SEO-слов
                 brand=c_info.brand,
-                price=final_price,
-                rating=c_info.rating if c_info.rating > 0 else 5.0,
-                feedbacks=c_info.feedbacks if c_info.feedbacks > 0 else 1,
+                price=c_info.price,
+                rating=c_info.rating,
+                feedbacks=c_info.feedbacks,
                 url=WB_PRODUCT_URL.format(sku=cand_sku),
                 subject_id=c_info.subject_id,
             ))
