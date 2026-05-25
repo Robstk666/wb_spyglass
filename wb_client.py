@@ -107,10 +107,14 @@ def _basket_urls(sku: int) -> list[str]:
 
     path = f"/vol{vol}/part{part}/{sku}/info/ru/card.json"
 
-    # Перебираем b-2 .. b+2 чтобы гарантированно попасть в нужный сервер
-    urls = []
-    for candidate in range(max(1, b - 2), b + 3):
-        urls.append(f"https://basket-{candidate:02d}.wbbasket.ru{path}")
+    # Перебираем все возможные корзины для надежности (их около 22)
+    # Начинаем с вероятной (чтобы 200 OK пришел мгновенно), затем остальные
+    urls = [f"https://basket-{b:02d}.wbbasket.ru{path}"]
+    
+    for candidate in range(1, 23):
+        if candidate != b:
+            urls.append(f"https://basket-{candidate:02d}.wbbasket.ru{path}")
+            
     return urls
 
 
@@ -451,7 +455,10 @@ class WildberriesClient:
         Т.к. динамический поиск WB сильно защищен (x-pow, Qrator), 
         для MVP используем железобетонный фолбек: поиск SKU через DuckDuckGo + сбор карточек из CDN.
         """
-        search_query = subject_name.strip() if subject_name.strip() else target_name.split("|")[0].strip()
+        # Для точного поиска (особенно в Google/DDG) лучше использовать название товара без мусора,
+        # так как subject_name (например, "Футболки") слишком общий и ведет на страницы категорий.
+        clean_target_name = target_name.split("|")[0].strip()
+        search_query = clean_target_name if clean_target_name else subject_name.strip()
         logger.info("▶ fetch_competitors fallback via DuckDuckGo query='%s' top=%d", search_query, top_n)
 
         # Фолбек: ищем конкурентов через DuckDuckGo Lite (работает без JS и обходит WAF WB)
