@@ -44,6 +44,7 @@ class Settings(BaseSettings):
 
     # Proxy для WB API (опционально)
     proxy_url: str = ""
+    scraper_api_key: str = ""
 
     # ── Вспомогательные свойства ──────────────────────────────────────────
     @property
