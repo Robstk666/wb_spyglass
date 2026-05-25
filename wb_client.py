@@ -472,7 +472,7 @@ class WildberriesClient:
         
         # Попытка 0: Ищем через Serper.dev API (стабильный Google Search)
         import os
-        serper_key = os.getenv("SERPER_API_KEY", "a868a0c0787a2fbc654c311f90455967efa81745")
+        serper_key = os.getenv("SERPER_API_KEY")
         if serper_key:
             logger.info("Trying Serper.dev for query='%s'", search_query)
             try:
