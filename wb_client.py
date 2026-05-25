@@ -155,12 +155,24 @@ class WBAnalysisData:
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def _get(session: AsyncSession, url: str, label: str = "") -> dict | None:
-    """GET с retry при 429. Возвращает JSON или None."""
+    """GET с retry при 429. Если задан SCRAPER_API_KEY, оборачивает запрос."""
     tag = f"[{label}] " if label else ""
+    
+    import os
+    import urllib.parse
+    scraper_key = os.getenv("SCRAPER_API_KEY")
+    
+    # Не оборачиваем статические запросы к basket (CDN WB), они не блочатся
+    use_scraper = bool(scraper_key and "wbbasket.ru" not in url)
+    
+    target_url = url
+    if use_scraper:
+        target_url = f"http://api.scraperapi.com?api_key={scraper_key}&url={urllib.parse.quote(url)}&keep_headers=true"
+
     for attempt, delay in enumerate(_RETRY_DELAYS, 1):
         try:
             logger.info("%sGET %s (attempt %d)", tag, url[:120], attempt)
-            resp = await session.get(url, headers=_HEADERS, timeout=5)
+            resp = await session.get(target_url, headers=_HEADERS, timeout=15 if use_scraper else 5)
             if resp.status_code == 200:
                 try:
                     return resp.json()
@@ -176,9 +188,10 @@ async def _get(session: AsyncSession, url: str, label: str = "") -> dict | None:
         except Exception as exc:
             logger.warning("%sRequest error: %s", tag, exc)
             return None
+            
     # финальная попытка
     try:
-        resp = await session.get(url, headers=_HEADERS, timeout=5)
+        resp = await session.get(target_url, headers=_HEADERS, timeout=15 if use_scraper else 5)
         if resp.status_code == 200:
             return resp.json()
     except Exception as exc:
