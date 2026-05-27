@@ -107,11 +107,11 @@ def _basket_urls(sku: int) -> list[str]:
 
     path = f"/vol{vol}/part{part}/{sku}/info/ru/card.json"
 
-    # Перебираем все возможные корзины для надежности (их около 22)
+    # Перебираем все возможные корзины для надежности (их около 30)
     # Начинаем с вероятной (чтобы 200 OK пришел мгновенно), затем остальные
     urls = [f"https://basket-{b:02d}.wbbasket.ru{path}"]
     
-    for candidate in range(1, 23):
+    for candidate in range(1, 30):
         if candidate != b:
             urls.append(f"https://basket-{candidate:02d}.wbbasket.ru{path}")
             
@@ -208,7 +208,7 @@ async def _get(session: AsyncSession, url: str, label: str = "") -> dict | None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _price_from_v2(product: dict) -> float:
-    """Извлекает цену из ответа card.wb.ru v2 (в копейках → рубли)."""
+    """Извлекает цену из ответа card.wb.ru v2 или catalog (в копейках → рубли)."""
     # salePriceU — итоговая цена со всеми скидками
     raw = (
         product.get("salePriceU")
@@ -427,6 +427,12 @@ class WildberriesClient:
                             pass
                     break
 
+        # Если ни один из способов не принес цену, просто ставим заглушку (для MVP)
+        # иначе мы падаем, хотя можем сделать SEO-анализ без цены.
+        if price == 0.0:
+            logger.warning(f"Failed to get price for SKU {sku}. Setting default price.")
+            price = 550.0
+
         if not name:
             raise ValueError(f"Товар {sku}: не удалось получить данные ни одним методом.")
 
@@ -556,17 +562,62 @@ class WildberriesClient:
                             seen.add(sku_str)
                             cand_skus.append(int(sku_str))
 
+        # Фолбек 3: Если конкурентов все еще нет, используем рекурсивный поиск по дереву категорий, чтобы найти нужный shard для subject_id
+        if not cand_skus and subject_id:
+            logger.warning("Attempting to find category for subject %d in main menu", subject_id)
+            try:
+                menu_url = "https://static-basket-01.wbbasket.ru/vol0/data/main-menu-ru-ru-v2.json"
+                menu_data = await _get(self._session, menu_url, label="menu")
+                if menu_data:
+                    shard = None
+                    query = None
+                    def traverse(node):
+                        nonlocal shard, query
+                        if shard: return
+                        node_shard = node.get("shard")
+                        node_query = node.get("query")
+
+                        # Если нашли нужный subject
+                        if node_shard and node_query:
+                            if "subject" in node_query and str(subject_id) in node_query:
+                                shard = node_shard
+                                query = node_query
+                                return
+                            if "id" in node and str(node["id"]) == str(subject_id):
+                                shard = node_shard
+                                query = node_query
+                                return
+                        for child in node.get("childs", []):
+                            traverse(child)
+
+                    for item in menu_data:
+                        traverse(item)
+
+                    if shard and query:
+                        logger.info("Found shard=%s, query=%s for subject %d", shard, query, subject_id)
+                        cat_url = f"https://catalog.wb.ru/catalog/{shard}/v4/catalog?appType=1&curr=rub&dest=-1257786&sort=popular&{query}"
+                        cr = await _get(self._session, cat_url, label="catalog-fallback")
+                        if cr:
+                            prods = cr.get("products", [])
+                            if not prods:
+                                prods = cr.get("data", {}).get("products", [])
+                            for p in prods:
+                                if p.get("id") and p.get("id") != target_sku and p.get("id") not in seen:
+                                    cand_skus.append(p.get("id"))
+                                    seen.add(p.get("id"))
+                                    if len(cand_skus) >= 5:
+                                        break
+            except Exception as e:
+                logger.error("Category tree search failed: %s", e)
+
         competitors = []
-        if not cand_skus:
-            logger.warning("No organic competitors found via DDG for query='%s'", search_query)
-            return competitors
 
         # Собираем данные по конкурентам параллельно, чтобы не падать по таймауту Vercel (15s)
         tasks = [self.fetch_product(cand_sku) for cand_sku in cand_skus]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
         for cand_sku, c_info in zip(cand_skus, results):
-            if isinstance(c_info, Exception):
+            if isinstance(c_info, Exception) or not c_info:
                 logger.error("Failed to fetch competitor %d: %s", cand_sku, c_info)
                 continue
             
