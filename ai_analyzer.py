@@ -24,7 +24,7 @@ from wb_client import CompetitorInfo, ProductInfo
 logger = logging.getLogger(__name__)
 
 # Бесплатная модель на OpenRouter (поддерживает русский, надёжная)
-DEFAULT_MODEL = "google/gemini-2.0-flash-lite-001"
+DEFAULT_MODEL = "google/gemini-2.5-flash-lite"
 
 # OpenRouter — OpenAI-совместимый эндпоинт
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
